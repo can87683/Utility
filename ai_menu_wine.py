@@ -22,6 +22,7 @@ import GPUtil
 import shutil
 
 
+
 class SystemConfig:
     def __init__(self):
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -98,23 +99,32 @@ class IPRow:
         self.frame.after(1000, self.update_ip_label)
 
     def get_lan_ip(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.5)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except OSError:
+            return "--.--.--.--"
 
     def get_public_ip(self):
-        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=1.5) as response:
-            return response.read().decode("utf-8").strip()
+        try:
+            req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=1.5) as response:
+                return response.read().decode("utf-8").strip()
+        except Exception:
+            return "--.--.--.--"
 
     def update_ip_label(self):
         def fetch():
-            lan = self.get_lan_ip()
-            wan = self.get_public_ip()
-            self.result_queue.put((lan, wan))
+            try:
+                lan = self.get_lan_ip()
+                wan = self.get_public_ip()
+                self.result_queue.put((lan, wan))
+            except Exception:
+                self.result_queue.put(("--.--.--.--", "--.--.--.--"))
         threading.Thread(target=fetch, daemon=True).start()
         self.frame.after(60000, self.update_ip_label)
 
