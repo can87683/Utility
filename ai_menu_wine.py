@@ -52,7 +52,7 @@ class Config:
         self.IPROW_FONT_SIZE = 26
         self.USAGE_FONT_SIZE = 20
         self.LIST_FONT_SIZE = 12
-        self.max_entries = 80
+        self.max_entries = 500
         self.file = "ai_menu_wine.ini"
         self.parser = configparser.ConfigParser()
         if os.path.exists(self.file):
