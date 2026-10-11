@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 # ai_menu_linux.py
-# Copyright Su Nie | BSD-3C License | https://github.com/can87683
+"""
+pip requirements (A=Z): customtkinter, GPUtil, psutil, setproctitle
+"""
 
 import setproctitle
-setproctitle.setproctitle("ai_menu_linux.py")
-
 import os
 import sys
+setproctitle.setproctitle(os.path.basename(sys.argv[0]))
+
 import threading
 import queue
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import messagebox, filedialog, StringVar
-import configparser
-import socket
-import urllib.request
-import subprocess
+import signal
+import time
 import shlex
+import shutil
+import socket
+import subprocess
+import configparser
+import urllib.request
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import customtkinter as ctk
 import psutil
 import GPUtil
-import shutil
 
 
 class SystemConfig:
@@ -30,11 +34,8 @@ class SystemConfig:
         os.environ["KMP_AFFINITY"] = "disabled"
         os.environ["KMP_SETTINGS"] = "0"
         os.environ["KMP_WARNINGS"] = "FALSE"
-
-        if self.is_wine():
-            print("🍷 Wine environment detected - applying threading optimizations")
-            os.environ["OPENBLAS_NUM_THREADS"] = "1"
-            os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
     def is_wine(self) -> bool:
         return os.environ.get('WINELOADERNOEXEC') is not None
@@ -43,84 +44,38 @@ class SystemConfig:
         return sys.platform.startswith('win')
 
 
-class Config:
-    def __init__(self):
-        self.title = "AI Menu"
-        self.window_width = 640
-        self.window_height = 300
-        self.IPROW_FONT_SIZE = 26
-        self.USAGE_FONT_SIZE = 20
-        self.LIST_FONT_SIZE = 12
-        self.max_entries = 500
-        self.file = "ai_menu_linux.ini"
-        self.parser = configparser.ConfigParser()
-        if os.path.exists(self.file):
-            self.parser.read(self.file)
-        else:
-            self.parser.read_dict(self._default_settings())
-
-        if "paths" not in self.parser:
-            self.parser["paths"] = {}
-        if "python" not in self.parser:
-            self.parser["python"] = {"binary_path": sys.executable}
-
-    def _default_settings(self):
-        return {
-            "window": {"width": str(self.window_width), "height": str(self.window_height), "x": "100", "y": "100"},
-            "python": {"binary_path": sys.executable},
-            "colors": {
-                "frame1_bg": "grey", "frame1_fg": "yellow",
-                "frame2_bg": "pink", "frame2_fg": "blue",
-                "frame3_bg": "yellow", "frame3_fg": "black",
-                "frame4_bg": "lime", "frame4_fg": "red",
-                "frame5_bg": "green", "frame5_fg": "yellow",
-                "border_color": "grey",
-            },
-            "paths": {}
-        }
-
-    def save(self):
-        with open(self.file, "w") as f:
-            self.parser.write(f)
-
-
 class IPRow:
-    def __init__(self, parent, config):
+    def __init__(self, parent, gui):
+        self.gui = gui
         self.frame = ctk.CTkFrame(parent, fg_color="#222222", height=40)
         self.frame.pack(fill="x")
         self.label = ctk.CTkLabel(
             self.frame, text="LAN: --.--.--.--  WAN: --.--.--.--",
-            font=("Arial", config.IPROW_FONT_SIZE),
+            font=("Arial", gui.IPROW_FONT_SIZE),
             fg_color="blue", text_color="yellow", anchor="center"
         )
         self.label.pack(expand=True, fill="x")
         self.result_queue = queue.Queue()
         self.fetch_in_progress = False
-        self.frame.after(100, self.check_queue)
+        self.frame.after(gui.QUEUE_POLL_MS, self.check_queue)
         self.frame.after(1000, self.update_ip_label)
 
     def get_lan_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.5)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except OSError:
-            return "--.--.--.--"
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
 
     def get_public_ip(self):
-        try:
-            req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=1.5) as response:
-                return response.read().decode("utf-8").strip()
-        except Exception:
-            return "--.--.--.--"
+        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=1.5) as response:
+            return response.read().decode("utf-8").strip()
 
     def update_ip_label(self):
         if self.fetch_in_progress:
-            self.frame.after(60000, self.update_ip_label)
+            self.frame.after(self.gui.REFRESH_IP_MS, self.update_ip_label)
             return
 
         def fetch():
@@ -130,7 +85,7 @@ class IPRow:
             self.result_queue.put((lan, wan))
             self.fetch_in_progress = False
         threading.Thread(target=fetch, daemon=True).start()
-        self.frame.after(60000, self.update_ip_label)
+        self.frame.after(self.gui.REFRESH_IP_MS, self.update_ip_label)
 
     def check_queue(self):
         try:
@@ -139,31 +94,33 @@ class IPRow:
                 self.label.configure(text=f"LAN: {lan}   WAN: {wan}")
         except queue.Empty:
             pass
-        self.frame.after(100, self.check_queue)
+        self.frame.after(self.gui.QUEUE_POLL_MS, self.check_queue)
 
 
 class UsageRow:
-    def __init__(self, parent, config):
+    def __init__(self, parent, gui):
+        self.gui = gui
         self.frame = ctk.CTkFrame(parent, fg_color="grey", height=40)
         self.frame.pack(fill="x")
         self.label = ctk.CTkLabel(
-            self.frame, text="Loading system usage...", font=("Arial", config.USAGE_FONT_SIZE),
+            self.frame, text="Loading system usage...",
+            font=("Arial", gui.USAGE_FONT_SIZE),
             fg_color="yellow", text_color="blue", anchor="center"
         )
         self.label.pack(expand=True, fill="x")
         self.result_queue = queue.Queue()
         self.fetch_in_progress = False
-        self.frame.after(100, self.check_queue)
+        self.frame.after(gui.QUEUE_POLL_MS, self.check_queue)
         self.frame.after(1000, self.update_usage)
 
     def update_usage(self):
         if self.fetch_in_progress:
-            self.frame.after(2000, self.update_usage)
+            self.frame.after(self.gui.REFRESH_USAGE_MS, self.update_usage)
             return
 
         def fetch():
             self.fetch_in_progress = True
-            cpu = psutil.cpu_percent(interval=0.5)
+            cpu = psutil.cpu_percent(interval=self.gui.USAGE_INTERVAL_S)
             dram = psutil.virtual_memory().percent
             gpu_percent = 0.0
             vram_percent = 0.0
@@ -176,7 +133,7 @@ class UsageRow:
             self.result_queue.put(text)
             self.fetch_in_progress = False
         threading.Thread(target=fetch, daemon=True).start()
-        self.frame.after(2000, self.update_usage)
+        self.frame.after(self.gui.REFRESH_USAGE_MS, self.update_usage)
 
     def check_queue(self):
         try:
@@ -185,34 +142,83 @@ class UsageRow:
                 self.label.configure(text=text)
         except queue.Empty:
             pass
-        self.frame.after(100, self.check_queue)
+        self.frame.after(self.gui.QUEUE_POLL_MS, self.check_queue)
 
 
 class AIMenuGUI:
+    title = "Copyright Su Nie | BSD-3C License | https://github.com/can87683"
+    window_width = 640
+    window_height = 300
+    IPROW_FONT_SIZE = 26
+    USAGE_FONT_SIZE = 20
+    LIST_FONT_SIZE = 12
+    BUTTON_WIDTH = 24
+    REFRESH_IP_MS = 60000
+    REFRESH_USAGE_MS = 2000
+    QUEUE_POLL_MS = 100
+    USAGE_INTERVAL_S = 0.5
+    KILL_GRACE_TICKS = 30
+    KILL_GRACE_SLEEP = 0.1
+    max_entries = 500
+
     def __init__(self):
-        self.config = Config()
+        # Derive ini filename from the script's actual name
+        script_path = os.path.abspath(sys.argv[0])
+        script_dir = os.path.dirname(script_path)
+        script_name = os.path.splitext(os.path.basename(script_path))[0]
+        self.file = os.path.join(script_dir, f"{script_name}.ini")
+
+        self.parser = configparser.ConfigParser()
+        self.parser.read_dict(self._default_settings())
+        self.parser.read(self.file)
+
+        if "paths" not in self.parser:
+            self.parser["paths"] = {}
+        if "python" not in self.parser:
+            self.parser["python"] = {"binary_path": sys.executable}
+
         self.path_entries = []
 
-        width = int(self.config.parser["window"].get("width", self.config.window_width))
-        height = int(self.config.parser["window"].get("height", self.config.window_height))
-        pos_x = int(self.config.parser["window"].get("x", 100))
-        pos_y = int(self.config.parser["window"].get("y", 100))
-        self.python_binary = self.config.parser["python"]["binary_path"]
+        pos_x = int(self.parser["window"].get("x", 100))
+        pos_y = int(self.parser["window"].get("y", 100))
+        self.python_binary = self.parser["python"]["binary_path"]
 
         self.root = ctk.CTk()
-        self.root.title(self.config.title)
-        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+        self.root.title(self.title)
+        self.root.geometry(f"{self.window_width}x{self.window_height}+{pos_x}+{pos_y}")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        self.ip_row = IPRow(self.root, self.config)
-        self.usage_row = UsageRow(self.root, self.config)
+        self.ip_row = IPRow(self.root, self)
+        self.usage_row = UsageRow(self.root, self)
         self.build_add_bar()
         self.build_path_container()
         self.load_paths_from_config()
 
+    def _default_settings(self):
+        return {
+            "window": {
+                "x": "100",
+                "y": "100",
+            },
+            "python": {"binary_path": sys.executable},
+            "colors": {
+                "frame1_bg": "grey", "frame1_fg": "yellow",
+                "frame2_bg": "pink", "frame2_fg": "blue",
+                "frame3_bg": "yellow", "frame3_fg": "black",
+                "frame4_bg": "lime", "frame4_fg": "red",
+                "frame5_bg": "green", "frame5_fg": "yellow",
+                "border_color": "grey",
+            },
+            "paths": {},
+        }
+
+    def save(self):
+        with open(self.file, "w") as f:
+            self.parser.write(f)
+
     def build_add_bar(self):
-        add_bar = ctk.CTkFrame(self.root, fg_color=self.config.parser["colors"]["frame5_bg"])
+        add_bar = ctk.CTkFrame(self.root, fg_color=self.parser["colors"]["frame5_bg"])
         add_bar.pack(fill="x")
 
         self.python_btn = ctk.CTkButton(
@@ -223,12 +229,14 @@ class AIMenuGUI:
 
         self.python_label = ctk.CTkLabel(
             add_bar, text=os.path.basename(self.python_binary),
-            font=("Arial", 10), fg_color=self.config.parser["colors"]["frame5_bg"],
+            font=("Arial", 10), fg_color=self.parser["colors"]["frame5_bg"],
             text_color="white", anchor="w"
         )
         self.python_label.pack(side="left", padx=1, pady=1)
 
-        ctk.CTkLabel(add_bar, text="  ", font=("Arial", 12), fg_color=self.config.parser["colors"]["frame5_bg"], text_color="white").pack(side="left", padx=1, pady=1)
+        ctk.CTkLabel(add_bar, text="  ", font=("Arial", 12),
+                     fg_color=self.parser["colors"]["frame5_bg"],
+                     text_color="white").pack(side="left", padx=1, pady=1)
 
         self.add_btn = ctk.CTkButton(
             add_bar, text="+ Add Path", font=("Arial", 12),
@@ -245,20 +253,20 @@ class AIMenuGUI:
     def build_path_container(self):
         self.frame5_container = ctk.CTkFrame(
             self.root,
-            fg_color=self.config.parser["colors"]["frame5_bg"],
-            border_color=self.config.parser["colors"]["border_color"],
+            fg_color=self.parser["colors"]["frame5_bg"],
+            border_color=self.parser["colors"]["border_color"],
             border_width=1,
-            width=int(self.config.parser["window"].get("width", self.config.window_width)),
+            width=self.window_width,
             height=650
         )
         self.frame5_container.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(
             self.frame5_container,
-            bg=self.config.parser["colors"]["frame5_bg"],
+            bg=self.parser["colors"]["frame5_bg"],
             highlightthickness=0
         )
-        self.scrollable_frame = tk.Frame(self.canvas, bg=self.config.parser["colors"]["frame5_bg"])
+        self.scrollable_frame = tk.Frame(self.canvas, bg=self.parser["colors"]["frame5_bg"])
 
         self.scrollable_frame.bind(
             "<Configure>",
@@ -299,47 +307,95 @@ class AIMenuGUI:
             return
         result = subprocess.run([filename, "--version"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and "Python 3.10" in result.stdout:
-            self.config.parser["python"]["binary_path"] = filename
+            self.parser["python"]["binary_path"] = filename
             self.python_binary = filename
             self.python_label.configure(text=os.path.basename(filename))
-            self.config.save()
+            self.save()
             messagebox.showinfo("Success", f"Python binary set:\n{filename}")
         else:
             messagebox.showwarning("Invalid Python", f"Not Python 3.10:\n{filename}")
 
-    def run_path(self, path: str):
-        path = path.strip()
+    def run_path(self, entry_data):
+        path = entry_data['full_path'].strip()
+        if not path:
+            messagebox.showwarning("Empty Path", "No script selected for this entry.")
+            return
+
         parts = shlex.split(path)
         executable = parts[0]
         args = parts[1:] if len(parts) > 1 else []
         cwd = None
 
-        if executable.lower() in ['python', 'python3', 'python.exe', 'python3.exe'] and len(args) > 0:
-            script_path = args[0]
-            cwd = os.path.dirname(os.path.abspath(script_path))
-            subprocess.Popen([self.python_binary] + args, cwd=cwd, env=os.environ.copy())
-        elif executable in ['bash', 'sh']:
-            if len(args) > 0:
-                script_path = args[0]
-                cwd = os.path.dirname(os.path.abspath(script_path))
-            subprocess.Popen([executable] + args, cwd=cwd, env=os.environ.copy())
+        if executable.lower() in ('python', 'python3', 'python.exe', 'python3.exe') and args:
+            cwd = os.path.dirname(os.path.abspath(args[0]))
+            cmd = [self.python_binary] + args
+        elif executable in ('bash', 'sh'):
+            if args:
+                cwd = os.path.dirname(os.path.abspath(args[0]))
+            cmd = [executable] + args
         else:
             if not os.path.exists(executable) and not os.path.isabs(executable):
-                executable = shutil.which(executable)
-            cwd = os.path.dirname(os.path.abspath(executable))
+                executable = shutil.which(executable) or executable
+            cwd = os.path.dirname(os.path.abspath(executable)) if os.path.exists(executable) else None
             if executable.endswith('.py'):
                 cmd = [self.python_binary, executable] + args
             elif executable.endswith('.sh'):
                 cmd = ['bash', executable] + args
             else:
                 cmd = [executable] + args
-            subprocess.Popen(cmd, cwd=cwd, env=os.environ.copy())
+
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=os.environ.copy(),
+            start_new_session=True,
+        )
+
+        entry_data['proc'] = proc
+        entry_data['label'].configure(
+            text=f"{os.path.basename(path)}  ● pid {proc.pid}",
+            text_color="lime",
+        )
+
+        def watch():
+            proc.wait()
+            if entry_data['frame'].winfo_exists():
+                entry_data['label'].configure(
+                    text=os.path.basename(path),
+                    text_color=self.parser["colors"]["frame5_fg"],
+                )
+            entry_data['proc'] = None
+        threading.Thread(target=watch, daemon=True).start()
+
+    def stop_path(self, entry_data):
+        proc = entry_data['proc']
+        if proc is None or proc.poll() is not None:
+            messagebox.showinfo("Not Running", "This entry is not currently running.")
+            return
+
+        pid = proc.pid
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+
+        def force_kill():
+            for _ in range(self.KILL_GRACE_TICKS):
+                if proc.poll() is not None:
+                    return
+                time.sleep(self.KILL_GRACE_SLEEP)
+            os.killpg(pgid, signal.SIGKILL)
+        threading.Thread(target=force_kill, daemon=True).start()
 
     def remove_path_entry(self, idx):
-        confirm = messagebox.askyesno("Remove Path", "Are you sure you want to remove this path entry?")
+        confirm = messagebox.askyesno(
+            "Remove Path",
+            "Are you sure you want to remove this path entry?\n"
+            "If it is running, it will be stopped."
+        )
         if not confirm:
             return
-        self.path_entries[idx]['frame'].destroy()
+        entry = self.path_entries[idx]
+        proc = entry['proc']
+        if proc is not None and proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        entry['frame'].destroy()
         self.path_entries.pop(idx)
         self.refresh_path_layout()
         self.save_paths_to_config()
@@ -357,27 +413,28 @@ class AIMenuGUI:
             entry_data['remove_btn'].configure(command=lambda idx=i: self.remove_path_entry(idx))
 
     def add_path_entry(self, path="", save_immediately=True):
-        if len(self.path_entries) >= self.config.max_entries:
-            messagebox.showwarning("Limit Reached", f"Maximum of {self.config.max_entries} entries reached.")
+        if len(self.path_entries) >= self.max_entries:
+            messagebox.showwarning("Limit Reached", f"Maximum of {self.max_entries} entries reached.")
             return
         row_idx = len(self.path_entries)
         col = row_idx % 2
         row = row_idx // 2
 
-        entry_frame = ctk.CTkFrame(self.scrollable_frame, fg_color=self.config.parser["colors"]["frame5_bg"])
+        entry_frame = ctk.CTkFrame(self.scrollable_frame, fg_color=self.parser["colors"]["frame5_bg"])
         entry_frame.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
         entry_frame.grid_columnconfigure(0, weight=1)
         entry_frame.grid_columnconfigure(1, weight=0)
         entry_frame.grid_columnconfigure(2, weight=0)
         entry_frame.grid_columnconfigure(3, weight=0)
+        entry_frame.grid_columnconfigure(4, weight=0)
 
         script_name = os.path.basename(path) if path else "[New]"
 
         name_label = ctk.CTkLabel(
             entry_frame, text=script_name,
-            fg_color=self.config.parser["colors"]["frame5_bg"],
-            text_color=self.config.parser["colors"]["frame5_fg"],
-            anchor="w", font=("Courier", self.config.LIST_FONT_SIZE, "bold")
+            fg_color=self.parser["colors"]["frame5_bg"],
+            text_color=self.parser["colors"]["frame5_fg"],
+            anchor="w", font=("Courier", self.LIST_FONT_SIZE, "bold")
         )
         name_label.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
 
@@ -387,32 +444,49 @@ class AIMenuGUI:
             'label': name_label,
             'browse_btn': None,
             'run_btn': None,
-            'remove_btn': None
+            'stop_btn': None,
+            'remove_btn': None,
+            'proc': None,
         }
 
         def open_browser():
             filename = filedialog.askopenfilename(
                 title="Select Script or Binary",
-                filetypes=[("Python Scripts", "*.py"), ("Executables", "*.exe"), ("Shell Scripts", "*.sh"), ("All Files", "*.*")]
+                filetypes=[("Python Scripts", "*.py"), ("Executables", "*.exe"),
+                           ("Shell Scripts", "*.sh"), ("All Files", "*.*")]
             )
             if filename:
                 entry_data['full_path'] = filename
                 name_label.configure(text=os.path.basename(filename))
                 self.save_paths_to_config()
 
-        btn_width = 24
-
-        browse_btn = ctk.CTkButton(entry_frame, text="Br", width=btn_width, command=open_browser)
+        browse_btn = ctk.CTkButton(entry_frame, text="Br", width=self.BUTTON_WIDTH, command=open_browser)
         browse_btn.grid(row=0, column=1, padx=1, pady=1)
 
-        run_btn = ctk.CTkButton(entry_frame, text="R", width=btn_width, fg_color="green", text_color="white", command=lambda: self.run_path(entry_data['full_path']))
+        run_btn = ctk.CTkButton(
+            entry_frame, text="R", width=self.BUTTON_WIDTH,
+            fg_color="green", text_color="white",
+            command=lambda: self.run_path(entry_data)
+        )
         run_btn.grid(row=0, column=2, padx=1, pady=1)
 
-        remove_btn = ctk.CTkButton(entry_frame, text="X", width=btn_width, fg_color="red", text_color="white", command=lambda idx=row_idx: self.remove_path_entry(idx))
-        remove_btn.grid(row=0, column=3, padx=1, pady=1)
+        stop_btn = ctk.CTkButton(
+            entry_frame, text="S", width=self.BUTTON_WIDTH,
+            fg_color="darkred", text_color="white",
+            command=lambda: self.stop_path(entry_data)
+        )
+        stop_btn.grid(row=0, column=3, padx=1, pady=1)
+
+        remove_btn = ctk.CTkButton(
+            entry_frame, text="X", width=self.BUTTON_WIDTH,
+            fg_color="red", text_color="white",
+            command=lambda idx=row_idx: self.remove_path_entry(idx)
+        )
+        remove_btn.grid(row=0, column=4, padx=1, pady=1)
 
         entry_data['browse_btn'] = browse_btn
         entry_data['run_btn'] = run_btn
+        entry_data['stop_btn'] = stop_btn
         entry_data['remove_btn'] = remove_btn
 
         self.path_entries.append(entry_data)
@@ -421,23 +495,20 @@ class AIMenuGUI:
             self.save_paths_to_config()
 
     def save_paths_to_config(self):
-        # 1. Properly clear the section to avoid configparser retention bugs
-        if self.config.parser.has_section("paths"):
-            self.config.parser.remove_section("paths")
-        self.config.parser.add_section("paths")
+        if self.parser.has_section("paths"):
+            self.parser.remove_section("paths")
+        self.parser.add_section("paths")
 
-        # 2. Repopulate with current entries
         for i, entry_data in enumerate(self.path_entries):
             path = entry_data['full_path'].strip()
             if path:
-                self.config.parser["paths"][f"path_{i}"] = path
+                self.parser["paths"][f"path_{i}"] = path
 
-        # 3. Save to file
-        self.config.save()
+        self.save()
 
     def load_paths_from_config(self):
-        if "paths" in self.config.parser:
-            paths_dict = dict(self.config.parser["paths"])
+        if "paths" in self.parser:
+            paths_dict = dict(self.parser["paths"])
             sorted_keys = sorted(
                 paths_dict.keys(),
                 key=lambda x: int(x.split('_')[1]) if '_' in x and x.split('_')[1].isdigit() else 0
@@ -451,15 +522,17 @@ class AIMenuGUI:
     def on_closing(self):
         if not messagebox.askyesno("Exit", "Are you sure you want to exit?"):
             return
+        for entry in self.path_entries:
+            proc = entry['proc']
+            if proc is not None and proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         geom = self.root.geometry()
-        size_part, pos_part = geom.split("+", 1)
-        w, h = size_part.split("x")
+        # geometry format: WxH+X+Y
+        pos_part = geom.split("+", 1)[1]
         x, y = pos_part.split("+")
-        self.config.parser["window"]["width"] = w
-        self.config.parser["window"]["height"] = h
-        self.config.parser["window"]["x"] = x
-        self.config.parser["window"]["y"] = y
-        self.config.save()
+        self.parser["window"]["x"] = x
+        self.parser["window"]["y"] = y
+        self.save()
         self.root.destroy()
 
     def run(self):
